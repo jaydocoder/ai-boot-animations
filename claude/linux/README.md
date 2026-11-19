@@ -17,14 +17,13 @@ macOS 版会用 `CGWindowListCopyWindowInfo` 读出 Claude 主窗口的位置，
 
 Linux 版做不到这一点，原因是 Wayland 的安全模型：**普通程序无法获取其它应用窗口的位置和大小**（X11 时代可以用 `xdotool`/`wmctrl`，Wayland 下原生窗口在合成器里，外部进程看不到）。你的 Claude 正是用 `--ozone-platform=wayland` 原生运行的，不在 XWayland 里，`wmctrl -l` 里根本不会出现它的窗口。
 
-所以 Linux 版改为**屏幕居中的全局浮层**：
+所以 Linux 版改为**铺满全屏的全局浮层**（也可切回屏幕居中）：
 
 | 项目 | macOS 版 | Linux 版 |
 |---|---|---|
-| 浮层位置 | 精确贴合 Claude 窗口，跟着移动缩放 | 屏幕居中（可调大小）或铺满全屏 |
+| 浮层位置 | 精确贴合 Claude 窗口，跟着移动缩放 | 铺满全屏（可选居中，尺寸可调） |
 | 触发时机 | 检测 Claude 启动后播放 | **登录后常驻**，可随时手动播放/关闭 |
 | 点击穿透 | 支持 | 支持（Wayland 下用空输入区域实现） |
-| 背景不透明度 | 支持 | 支持 |
 | 开屏音量 | 支持 | 支持 |
 | 字幕 | 支持 | 支持 |
 
@@ -104,9 +103,9 @@ cd ai-boot-animations/claude/linux
 | `subtitles` | 两句 | 字幕文字和起止秒数 |
 | `subtitleFadeSeconds` | 0.5 | 字幕渐显渐隐时长 |
 | `subtitleWidthRatio` | 0.6 | 字幕大小 |
-| `overlayMode` | `"center"` | `center` 居中浮层 / `fullscreen` 铺满全屏 |
-| `overlayWidthRatio` | 0.62 | 居中模式下的宽度占屏幕比例 |
-| `overlayHeightRatio` | 0.72 | 居中模式下的高度占屏幕比例 |
+| `overlayMode` | `"fullscreen"` | `fullscreen` 铺满全屏 / `center` 居中浮层 |
+| `overlayWidthRatio` | 0.62 | 仅居中模式有效：宽度占屏幕比例 |
+| `overlayHeightRatio` | 0.72 | 仅居中模式有效：高度占屏幕比例 |
 | `cornerRadius` | 12 | 浮层圆角 |
 
 ## 命令行参数

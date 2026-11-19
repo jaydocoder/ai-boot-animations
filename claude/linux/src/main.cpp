@@ -126,7 +126,7 @@ struct Config {
     double subtitleFadeSeconds = 0.5;
     double subtitleWidthRatio = 0.6;
     // Linux 版新增
-    QString overlayMode = "center";     // center = 屏幕居中；fullscreen = 铺满屏幕
+    QString overlayMode = "fullscreen";  // fullscreen = 铺满屏幕；center = 屏幕居中
     double overlayWidthRatio = 0.62;    // 居中模式下浮层宽度占屏幕比例
     double overlayHeightRatio = 0.72;   // 居中模式下浮层高度占屏幕比例
     double cornerRadius = 12;           // 浮层圆角
@@ -564,6 +564,14 @@ public:
         slVolume = addSlider(grid, row, QStringLiteral("开屏音量"), 0, 1.0);
         slWidth = addSlider(grid, row, QStringLiteral("浮层宽度"), 0.3, 1.0);
         slHeight = addSlider(grid, row, QStringLiteral("浮层高度"), 0.3, 1.0);
+        // 全屏模式下宽高无意义，直接禁用并说明
+        fullscreenHint = new QLabel(QStringLiteral("当前为全屏模式，宽度/高度不生效。\n"
+                                                   "想改成居中浮层：在设置文件里把 overlayMode 改成 \"center\"。"),
+                                    this);
+        fullscreenHint->setWordWrap(true);
+        fullscreenHint->setStyleSheet("color: palette(mid); font-size: 11px;");
+        grid->addWidget(fullscreenHint, row, 0, 1, 3);
+        row++;
         root->addWidget(look);
 
         auto *nowBox = new QGroupBox(QStringLiteral("现在，在屏幕上"), this);
@@ -611,6 +619,11 @@ public:
         slVolume->setValue(static_cast<int>(c.introVolume * 100));
         slWidth->setValue(static_cast<int>(c.overlayWidthRatio * 100));
         slHeight->setValue(static_cast<int>(c.overlayHeightRatio * 100));
+        // 全屏模式：宽度/高度滑块无意义，禁用它并显示提示
+        const bool full = (c.overlayMode == "fullscreen");
+        slWidth->setEnabled(!full);
+        slHeight->setEnabled(!full);
+        fullscreenHint->setVisible(full);
     }
 
 private:
@@ -622,6 +635,7 @@ private:
     QSlider *slVolume = nullptr;
     QSlider *slWidth = nullptr;
     QSlider *slHeight = nullptr;
+    QLabel *fullscreenHint = nullptr;
 
     QSlider *addSlider(QGridLayout *grid, int &row, const QString &title, double lo, double hi) {
         auto *label = new QLabel(title, this);
