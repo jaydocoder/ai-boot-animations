@@ -148,7 +148,7 @@ claude-boot-animation --uninstall  # 卸载
 - 进入循环帧后把窗口设为 `WA_TransparentForMouseEvents`，Wayland 下会得到空输入区域，鼠标事件直接落到下层应用
 - 到 `fadeStartSeconds` 用定时器把整体不透明度渐变到 `residualAlpha`
 
-### 两个 Linux 特有的坑（踩过了，写在这里省得再踩）
+### 三个 Linux 特有的坑（踩过了，写在这里省得再踩）
 
 **1. `mpv_create()` 必须在 `QApplication` 构造之前调用**
 
@@ -157,6 +157,18 @@ libmpv 内部依赖 GLib 主循环。如果在 Qt 已经接管主线程之后再
 **2. 单实例 socket 名不能带哈希**
 
 一开始用 `qHash(路径)` 拼 socket 名，但 Qt 的字符串哈希在每次进程启动时随机化，两次运行算出不同名字，导致 `removeServer()` 清不掉旧 socket、新实例误判「已有实例在跑」而直接退出。改成固定名字后就正常了。
+
+**3. mpv 不要强制 `gpu-api=opengl`，且不要嵌在带 `WA_TranslucentBackground` 的父窗口里**
+
+这是最折腾的一个，症状是「整屏黑屏、什么都看不到」：
+
+- `mpv_create()` 必须在 `QApplication` 之前（第 1 条）。这一点满足后，`initializeGL` 会正常执行、`mpv_render_context_create` 返回成功、`paintGL` 里的 `mpv_render_context_render` 也返回 0（success）——**一路绿灯，但屏幕就是黑的**。
+- 原因有两层：
+  1. 显式设 `gpu-api=opengl`（桌面 GL）会和 Qt 在 Wayland 下拿到的 GLES/EGL 上下文不匹配。去掉这个选项，让 mpv 自己适配。
+  2. `QOpenGLWidget` 不能作为普通透明 `QWidget` 的子控件——`paintGL` 甚至不会被调用。改为让视频控件自己作为顶层无边框窗口。
+- 半透明不能用 `setWindowOpacity`（Wayland 不支持）也不能用 `QGraphicsOpacityEffect`（对 GL 控件无效）。正确做法：mpv 渲染到独立的 `QOpenGLFramebufferObject`，再用 `QOpenGLTextureBlitter` 带 opacity 合成到屏幕。
+- 叠加字幕时不要用 `QPainter(this)`，它会切换 framebuffer 把刚渲染的视频冲掉（表现为“有字幕就黑屏”）。要用 `QOpenGLPaintDevice` 绑定当前上下文。
+- 方向问题：mpv 的 `FLIP_Y` 和 blitter 的 origin 会叠加翻转，两处只能有一处生效，否则画面上下颠倒。
 
 ## 授权
 

@@ -36,8 +36,13 @@
 #include <QOpenGLContext>
 #include <QOpenGLShaderProgram>
 #include <QWidgetAction>
+#include <QGraphicsOpacityEffect>
+#include <QOpenGLPaintDevice>
 #include <QPainterPath>
 #include <QSurfaceFormat>
+#include <QOpenGLFramebufferObject>
+#include <QOpenGLTextureBlitter>
+#include <memory>
 #include <QProcess>
 #include <QHBoxLayout>
 #include <QGridLayout>
@@ -78,7 +83,7 @@ static QString appDataDir() {
 // ---------------------------------------------------------------------------
 
 static QFile *g_logFile = nullptr;
-
+static int g_paintCount = 0;   // 诊断用：paintGL 调用计数
 static QString logPath() {
     return appDataDir() + "/log.txt";
 }
@@ -253,7 +258,8 @@ public:
         }
         // 把 mpv 渲染到我们提供的 FBO 里，浮层才能做到透明 + 圆角
         mpv_set_option_string(mpv, "vo", "libmpv");
-        mpv_set_option_string(mpv, "gpu-api", "opengl");
+        // 不强制 gpu-api：Qt 的 QOpenGLWidget 在 Wayland 下给的可能正是 GLES/EGL，
+        // 硬指定桌面 GL 会让上下文不匹配 —— 渲染返回成功但屏幕全黑。
         mpv_set_option_string(mpv, "hwdec", "auto-safe");
         mpv_set_option_string(mpv, "keep-open", "yes");
         mpv_set_option_string(mpv, "idle", "yes");
@@ -376,23 +382,36 @@ public:
 // 视频渲染控件：把 mpv 的帧画进自己的 FBO，交给 Qt 合成
 // ---------------------------------------------------------------------------
 
-class MpvWidget : public QOpenGLWidget {
+class MpvWidget : public QOpenGLWidget, protected QOpenGLFunctions {
 public:
     explicit MpvWidget(QWidget *parent = nullptr) : QOpenGLWidget(parent) {
         setAttribute(Qt::WA_TransparentForMouseEvents);
         setAttribute(Qt::WA_NoSystemBackground);
     }
 
+    ~MpvWidget() override {
+        if (renderCtx) {
+            makeCurrent();
+            mpv_render_context_free(renderCtx);
+            renderCtx = nullptr;
+            doneCurrent();
+        }
+    }
+
     MpvPlayer *player = nullptr;
     bool firstFrameShown = false;
-
+    double overlayAlpha = 1.0;   // 浮层整体不透明度（循环背景约 0.25）
+    QString subtitle;            // 当前字幕文字
+    double subtitleAlpha = 0.0;  // 字幕透明度
+    double subtitleWidthRatio = 0.6;
     std::function<void()> onFirstFrame;
 
 protected:
     void initializeGL() override {
+        initializeOpenGLFunctions();
         if (!player || !player->mpv) return;
-        // Qt 的上下文已经 current，让 mpv 用这个上下文出帧
-        // mpv 需要一个 GL 符号解析回调；QOpenGLContext 提供了跨平台实现
+        logMsg(QStringLiteral("initializeGL 开始"));
+
         mpv_opengl_init_params gl_init{};
         gl_init.get_proc_address = [](void *ctx, const char *name) -> void * {
             auto *w = static_cast<MpvWidget *>(ctx);
@@ -416,6 +435,7 @@ protected:
             renderCtx = nullptr;
             return;
         }
+        logMsg(QStringLiteral("mpv 渲染上下文创建成功"));
         mpv_render_context_set_update_callback(renderCtx, [](void *ctx) {
             auto *w = static_cast<MpvWidget *>(ctx);
             QMetaObject::invokeMethod(w, [w] { w->update(); }, Qt::QueuedConnection);
@@ -424,27 +444,90 @@ protected:
 
     void paintGL() override {
         if (!renderCtx) {
-            // 还没拿到渲染上下文：先铺一层黑底，避免闪白
-            glClearColor(0, 0, 0, 0);
-            glClear(GL_COLOR_BUFFER_BIT);
+            logMsg(QStringLiteral("paintGL 时渲染上下文未就绪"));
             return;
         }
-        // 关键：背景必须透明，否则浮层会变成一块不透明黑砖
-        GLint fbo = 0;
-        glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fbo);
+        // 先把当前 FBO 清成透明，再让 mpv 覆盖上去
         glClearColor(0, 0, 0, 0);
         glClear(GL_COLOR_BUFFER_BIT);
 
+        GLint fbo = 0;
+        glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fbo);
         int w = static_cast<int>(width() * devicePixelRatioF());
         int h = static_cast<int>(height() * devicePixelRatioF());
-        mpv_opengl_fbo mpfbo{static_cast<int>(fbo), w, h, 0};
-        int flipY = 1;
+        if (w <= 0 || h <= 0) {
+            logMsg(QStringLiteral("paintGL 尺寸非法 %1x%2").arg(w).arg(h));
+            return;
+        }
+
+        // 半透明实现：mpv 先画到自己的 FBO 纹理，再按 overlayAlpha 用
+        // QOpenGLTextureBlitter 合成到窗口帧缓冲。
+        // 原因：Wayland 不支持 setWindowOpacity，QGraphicsOpacityEffect 对 GL 控件也无效。
+        if (!videoFbo || videoFbo->width() != w || videoFbo->height() != h) {
+            videoFbo.reset(new QOpenGLFramebufferObject(w, h, QOpenGLFramebufferObject::CombinedDepthStencil));
+            blitter.reset(new QOpenGLTextureBlitter());
+            blitter->create();
+        }
+        mpv_opengl_fbo mpfbo{static_cast<int>(videoFbo->handle()), w, h, 0};
+        // 注意：这里不翻转（flipY=0），方向统一交给下面的 blitter 处理，
+        // 两处都翻转会导致画面上下颠倒。
+        int flipY = 0;
         mpv_render_param params[] = {
             {MPV_RENDER_PARAM_OPENGL_FBO, &mpfbo},
             {MPV_RENDER_PARAM_FLIP_Y, &flipY},
             {MPV_RENDER_PARAM_INVALID, nullptr},
         };
-        mpv_render_context_render(renderCtx, params);
+        const int rc = mpv_render_context_render(renderCtx, params);
+        Q_UNUSED(fbo);
+
+        // 合成到窗口帧缓冲，按 overlayAlpha 决定不透明度
+        if (blitter && videoFbo) {
+            glBindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(fbo));
+            glViewport(0, 0, w, h);
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            blitter->bind();
+            blitter->setOpacity(static_cast<float>(overlayAlpha));
+            QMatrix4x4 target;
+            target.setToIdentity();
+            blitter->blit(videoFbo->texture(), target, QOpenGLTextureBlitter::OriginTopLeft);
+            blitter->release();
+            glDisable(GL_BLEND);
+        }
+        if (rc < 0 && g_paintCount < 3) {
+            // 只在失败时记日志，避免持续刷盘
+            logMsg(QStringLiteral("mpv 渲染失败：%1").arg(mpv_error_string(rc)));
+            g_paintCount++;
+        }
+        // 字幕叠加：必须把 QPainter 绑定到当前上下文和同一个 FBO，
+        // 否则 QPainter 会切换 framebuffer，把刚画好的视频内容冲掉（表现为黑屏）。
+        if (!subtitle.isEmpty() && subtitleAlpha > 0.001) {
+            QOpenGLPaintDevice device(w, h);
+            QPainter painter(&device);
+            painter.scale(static_cast<qreal>(w) / width(), static_cast<qreal>(h) / height());
+            painter.setRenderHint(QPainter::Antialiasing, true);
+            painter.setRenderHint(QPainter::TextAntialiasing, true);
+            const double size = std::max(18.0, std::min(width() * subtitleWidthRatio / 15.5, height() * 0.09));
+            QFont f = painter.font();
+            f.setPointSizeF(size);
+            f.setItalic(true);
+            f.setFamily(QStringLiteral("Georgia"));
+            painter.setFont(f);
+            painter.setOpacity(subtitleAlpha);
+            QFontMetricsF fm(f);
+            const double tw = fm.horizontalAdvance(subtitle);
+            const QPointF baseline((width() - tw) / 2.0,
+                                   height() * 0.85 - size * 0.15 + fm.ascent() / 2.5);
+            QPainterPath path;
+            path.addText(baseline, f, subtitle);
+            QPen outline(QColor(0, 0, 0, 220));
+            outline.setWidthF(std::max(3.0, size * 0.10));
+            outline.setJoinStyle(Qt::RoundJoin);
+            painter.strokePath(path, outline);
+            painter.fillPath(path, Qt::white);
+            painter.end();
+        }
+
         if (!firstFrameShown) {
             firstFrameShown = true;
             if (onFirstFrame) onFirstFrame();
@@ -453,6 +536,8 @@ protected:
 
 private:
     mpv_render_context *renderCtx = nullptr;
+    std::unique_ptr<QOpenGLFramebufferObject> videoFbo;
+    std::unique_ptr<QOpenGLTextureBlitter> blitter;
 };
 
 // ---------------------------------------------------------------------------
@@ -461,14 +546,21 @@ private:
 
 class OverlayWindow : public QWidget {
 public:
-    explicit OverlayWindow(QWidget *parent = nullptr) : QWidget(parent), video(new MpvWidget(this)) {
+    explicit OverlayWindow(QWidget *parent = nullptr) : QWidget(parent) {
         setWindowFlags(Qt::FramelessWindowHint | Qt::WindowStaysOnTopHint | Qt::Tool);
-        setAttribute(Qt::WA_TranslucentBackground);
+        // 注意：这里不能设 WA_TranslucentBackground。
+        // 在 GNOME Wayland 下，QOpenGLWidget 作为带透明属性的 QWidget 的子控件时，
+        // paintGL 可能不被调用、GL 内容也不会被合成，表现为整屏黑。
+        // 改为让视频控件自己作为顶层窗口（见 video），由它负责绘制。
         setAttribute(Qt::WA_ShowWithoutActivating);
-        video->setGeometry(rect());
+        video = new MpvWidget();
+        video->setWindowFlags(Qt::FramelessWindowHint | Qt::WindowStaysOnTopHint | Qt::Tool);
+        video->setAttribute(Qt::WA_ShowWithoutActivating);
+        video->setAttribute(Qt::WA_TransparentForMouseEvents);
     }
 
     MpvWidget *video = nullptr;
+    QGraphicsOpacityEffect *videoOpacity = nullptr;
     double radius = 12;
     bool clickThrough = false;
     double bgAlpha = 1.0;
@@ -478,35 +570,63 @@ public:
 
     void setClickThrough(bool on) {
         clickThrough = on;
-        // Wayland 下 WA_TransparentForMouseEvents 让整个输入区域为空，鼠标事件穿透到下方应用
+        // Wayland 下让输入区域为空 = 鼠标穿透到下方应用
+        video->setAttribute(Qt::WA_TransparentForMouseEvents, true);
         setAttribute(Qt::WA_TransparentForMouseEvents, on);
-        if (on) setWindowFlag(Qt::NoDropShadowWindowHint, true);
         update();
     }
 
     void setBgAlpha(double a) {
         bgAlpha = std::max(0.0, std::min(1.0, a));
+        // Wayland 不支持 setWindowOpacity，改用 QGraphicsOpacityEffect 作用于视频控件
+        video->overlayAlpha = bgAlpha;
+        if (!videoOpacity) {
+            videoOpacity = new QGraphicsOpacityEffect(video);
+            video->setGraphicsEffect(videoOpacity);
+        }
+        videoOpacity->setOpacity(bgAlpha);
         update();
     }
 
     void setSubtitle(const QString &text, double alpha) {
         subtitle = text;
         subtitleAlpha = alpha;
-        update();
+        // 字幕由视频控件在 GL 之后叠加绘制（容器窗口不显示）
+        video->subtitle = text;
+        video->subtitleAlpha = alpha;
+        video->subtitleWidthRatio = subtitleWidthRatio;
+        video->update();
     }
 
-    void resizeEvent(QResizeEvent *) override { video->setGeometry(rect()); }
+    void setGeometryAll(const QRect &geo) {
+        video->setGeometry(geo);
+        video->resize(geo.size());
+    }
+
+    void showAll() {
+        // 只显示视频窗口。容器窗口不显示，否则屏幕上会多出空白窗口。
+        video->show();
+        video->raise();
+    }
+
+    void hideAll() {
+        video->hide();
+    }
+
+    void updateGeometryFollow(const QRect &geo) {
+        if (video->geometry() != geo) {
+            video->setGeometry(geo);
+            video->resize(geo.size());
+        }
+    }
 
     void paintEvent(QPaintEvent *) override {
+        // 父窗口本身只画字幕（半透明叠加），不参与视频合成
+        if (subtitle.isEmpty() || subtitleAlpha <= 0.001) return;
         QPainter p(this);
         p.setRenderHint(QPainter::Antialiasing, true);
         p.setRenderHint(QPainter::TextAntialiasing, true);
-        // 圆角裁剪，标出浮层范围；背景完全透明时才真正透出下层
-        const QRectF r = QRectF(rect()).adjusted(0.5, 0.5, -0.5, -0.5);
-        p.setOpacity(bgAlpha);
         drawSubtitles(p);
-        p.setOpacity(1.0);
-        Q_UNUSED(r);
     }
 
 private:
@@ -520,13 +640,13 @@ private:
         f.setFamily(QStringLiteral("Georgia"));
         p.setFont(f);
         p.setOpacity(subtitleAlpha);
-        const QRectF box(20, height() * 0.85 - size, width() - 40, size * 3);
-        // 先描边再填白：黑边只露在字外圈一点，亮背景上也看得清
-        QPainterPath path;
         QFontMetricsF fm(f);
         const double tw = fm.horizontalAdvance(subtitle);
-        const QPointF baseline((width() - tw) / 2.0, box.center().y() + fm.ascent() / 2.5);
+        const QPointF baseline((width() - tw) / 2.0,
+                               height() * 0.85 - size * 0.15 + fm.ascent() / 2.5);
+        QPainterPath path;
         path.addText(baseline, f, subtitle);
+        // 先描黑边再填白：亮背景上也看得清
         QPen outline(QColor(0, 0, 0, 220));
         outline.setWidthF(std::max(3.0, size * 0.10));
         outline.setJoinStyle(Qt::RoundJoin);
@@ -534,8 +654,6 @@ private:
         p.fillPath(path, Qt::white);
     }
 };
-
-// ---------------------------------------------------------------------------
 // 设置窗口
 // ---------------------------------------------------------------------------
 
@@ -741,10 +859,14 @@ public:
         overlay = new OverlayWindow();
         overlay->radius = config.cornerRadius;
         overlay->subtitleWidthRatio = config.subtitleWidthRatio;
-        overlay->setGeometry(overlayGeometry());
+        const QRect geo = overlayGeometry();
+        // 视频控件是独立顶层窗口，几何直接给全屏矩形
+        overlay->setGeometryAll(geo);
         overlay->video->onFirstFrame = [this] {
             logMsg(QStringLiteral("第一帧出画面"));
         };
+        logMsg(QStringLiteral("浮层几何 %1x%2 @%3,%4")
+                   .arg(geo.width()).arg(geo.height()).arg(geo.x()).arg(geo.y()));
 
         if (!player.init(introPath, loopPath)) {
             logMsg(QStringLiteral("mpv 初始化失败"));
@@ -754,8 +876,7 @@ public:
         }
         player.setVolume(withIntro ? config.introVolume : 0);
         overlay->video->player = &player;
-        overlay->show();
-        overlay->raise();
+        overlay->showAll();
 
         player.onTime = [this](double t) { tickTime(t); };
         player.observeTimePos();
@@ -885,7 +1006,7 @@ public:
         if (volumeRamp) { volumeRamp->stop(); volumeRamp->deleteLater(); volumeRamp = nullptr; }
         player.onTime = nullptr;
         player.destroy();
-        if (overlay) { overlay->hide(); overlay->deleteLater(); overlay = nullptr; }
+        if (overlay) { overlay->hideAll(); overlay->deleteLater(); overlay = nullptr; }
         logMsg(QStringLiteral("播放结束"));
         const bool wasExit = exitWhenDone;
         exitWhenDone = false;

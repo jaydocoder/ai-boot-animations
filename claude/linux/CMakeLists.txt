@@ -11,13 +11,13 @@ endif()
 
 find_package(PkgConfig REQUIRED)
 find_package(OpenGL REQUIRED)
-find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets Network OpenGLWidgets)
+find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets Network OpenGL OpenGLWidgets)
 pkg_check_modules(MPV REQUIRED IMPORTED_TARGET mpv)
 
 add_executable(ClaudeBootAnimation src/main.cpp)
 
 target_link_libraries(ClaudeBootAnimation PRIVATE
-    Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Network Qt6::OpenGLWidgets
+    Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Network Qt6::OpenGL Qt6::OpenGLWidgets
     OpenGL::GL
     PkgConfig::MPV
 )
