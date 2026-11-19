@@ -1,4 +1,5 @@
 build/
+claude/linux/build/
 .DS_Store
 claude/windows/build/
 claude/windows/assets/*.mp4
